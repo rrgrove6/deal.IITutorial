@@ -24,6 +24,7 @@
 #include <deal.II/base/timer.h>
 
 #include <deal.II/lac/generic_linear_algebra.h>
+#include <string>
 
 #define USE_PETSC_LA
 
@@ -66,7 +67,6 @@ namespace LA
 #include <deal.II/distributed/tria.h>
 #include <deal.II/distributed/grid_refinement.h>
 #include <deal.II/matrix_free/helper_functions.h>
-#include <deal.II/numerics/vector_tools.h>
 
 #include <fstream>
 #include <iostream>
@@ -87,8 +87,8 @@ namespace Step40
 
   private:
     void setup_system ();
-    void assemble_system ();
-    void solve ();
+    void assemble_system (bool for_u);
+    void solve (bool for_u);
     void refine_grid ();
     void output_results (const unsigned int cycle) const;
 
@@ -105,12 +105,20 @@ namespace Step40
     ConstraintMatrix                          constraints;
 
     LA::MPI::SparseMatrix system_matrix;
-    LA::MPI::Vector locally_relevant_solution;
+    LA::MPI::Vector locally_relevant_solution_u;
+    LA::MPI::Vector locally_relevant_solution_v;
+    LA::MPI::Vector old_locally_relevant_solution_u;
+    LA::MPI::Vector old_locally_relevant_solution_v;
     LA::MPI::Vector system_rhs;
     LA::MPI::Vector number_of_locally_owned_dofs;
 
+    double time, time_step;
+    unsigned int timestep_number;
+
     ConditionalOStream                        pcout;
     TimerOutput                               computing_timer;
+    double                                    theta;
+    bool									  for_u;
   };
 
 
@@ -132,7 +140,9 @@ namespace Step40
     computing_timer (mpi_communicator,
                      pcout,
                      TimerOutput::summary,
-                     TimerOutput::wall_times)
+                     TimerOutput::wall_times),
+    time_step (1./64),
+    theta (0.5)
   {}
 
 
@@ -159,8 +169,14 @@ namespace Step40
     DoFTools::extract_locally_relevant_dofs (dof_handler,
                                              locally_relevant_dofs);
 
-    locally_relevant_solution.reinit (locally_owned_dofs,
+    locally_relevant_solution_u.reinit (locally_owned_dofs,
                                       locally_relevant_dofs, mpi_communicator);
+    locally_relevant_solution_v.reinit (locally_owned_dofs,
+    	                           	  locally_relevant_dofs, mpi_communicator);
+    old_locally_relevant_solution_u.reinit (locally_owned_dofs,
+    		                          locally_relevant_dofs, mpi_communicator);
+    old_locally_relevant_solution_v.reinit (locally_owned_dofs,
+    		                          locally_relevant_dofs, mpi_communicator);
     system_rhs.reinit (locally_owned_dofs, mpi_communicator);
 
     constraints.clear ();
@@ -191,8 +207,11 @@ namespace Step40
 
 
   template <int dim>
-  void LaplaceProblem<dim>::assemble_system ()
+  void LaplaceProblem<dim>::assemble_system (bool for_u)
   {
+	system_matrix = 0;
+    system_rhs = 0;
+
     TimerOutput::Scope t(computing_timer, "assembly");
 
     const QGauss<dim>  quadrature_formula(3);
@@ -211,6 +230,15 @@ namespace Step40
 
     std::vector<types::global_dof_index> local_dof_indices (dofs_per_cell);
 
+    double lhs_term = 0.0;
+    double rhs_term = 0.0;
+
+    std::vector< double> solution_u_values;
+    std::vector< double> old_solution_u_values;
+    std::vector< double> old_solution_v_values;
+    std::vector< Tensor< 1, dim > > solution_u_grad;
+    std::vector< Tensor< 1, dim > > old_solution_u_grad;
+
     typename DoFHandler<dim>::active_cell_iterator
     cell = dof_handler.begin_active(),
     endc = dof_handler.end();
@@ -223,50 +251,124 @@ namespace Step40
 
           fe_values.reinit (cell);
 
+          solution_u_values.resize(n_q_points);
+          old_solution_u_values.resize(n_q_points);
+          old_solution_v_values.resize(n_q_points);
+          solution_u_grad.resize(n_q_points);
+          old_solution_u_grad.resize(n_q_points);
+
+          fe_values.get_function_values(locally_relevant_solution_u ,solution_u_values);
+          fe_values.get_function_values(old_locally_relevant_solution_u ,old_solution_u_values);
+          fe_values.get_function_values(old_locally_relevant_solution_v ,old_solution_v_values);
+          fe_values.get_function_gradients(locally_relevant_solution_u ,solution_u_grad);
+          fe_values.get_function_gradients(old_locally_relevant_solution_u ,old_solution_u_grad);
+
           for (unsigned int q_point=0; q_point<n_q_points; ++q_point)
             {
-              const double
-              rhs_value
-                = (fe_values.quadrature_point(q_point)[1]
-                   >
-                   0.5+0.25*std::sin(4.0 * numbers::PI *
-                                     fe_values.quadrature_point(q_point)[0])
-                   ? 1 : -1);
+
+              double rhs_value = 0;
+              double old_rhs_value = 0;
 
               for (unsigned int i=0; i<dofs_per_cell; ++i)
                 {
-                  for (unsigned int j=0; j<dofs_per_cell; ++j)
-                    cell_matrix(i,j) += (fe_values.shape_grad(i,q_point) *
-                                         fe_values.shape_grad(j,q_point) *
-                                         fe_values.JxW(q_point));
 
-                  cell_rhs(i) += (rhs_value *
-                                  fe_values.shape_value(i,q_point) *
-                                  fe_values.JxW(q_point));
+                  for (unsigned int j=0; j<dofs_per_cell; ++j)
+                  {
+                	  if (for_u == true)
+                		  lhs_term = time_step * time_step *
+                		             theta * theta *
+                		             fe_values.shape_grad(i,q_point) *
+                				     fe_values.shape_grad(j,q_point) *
+                				     fe_values.JxW(q_point);
+
+                	  cell_matrix(i,j) += ((fe_values.shape_value(i,q_point) *
+                			  fe_values.shape_value(j,q_point)) *
+                			  fe_values.JxW(q_point) +
+                			  lhs_term);
+                  }
+
+                  if(for_u == true)
+                	  rhs_term = (
+                			          fe_values.shape_value(i,q_point) *
+                					  old_solution_u_values[q_point]
+                					  -
+                					  time_step * time_step *
+                					  theta * (1 - theta) *
+                					  fe_values.shape_grad(i,q_point) *
+                					  old_solution_u_grad[q_point]
+                				      +
+                				      time_step *
+    								  fe_values.shape_value(i,q_point) *
+									  old_solution_v_values[q_point]
+   								      -
+									  time_step * time_step *
+									  theta *
+									  (
+											  theta *
+											  rhs_value *
+										      fe_values.shape_value(i,q_point)
+										      +
+										      (1 - theta) *
+										      old_rhs_value *
+										      fe_values.shape_value(i,q_point)
+						              )
+                				 ) *
+                    		     fe_values.JxW(q_point);
+                  else
+                	  rhs_term = (
+//                			  fe_values.shape_value(i,q_point) //*
+        					  //old_solution_v_values(q_point)
+//             				  -
+//             				  time_step *
+//                			      (
+//                			    	  theta*
+//                			    	  fe_values.shape_grad(i,q_point) //*
+                			    	  //solution_u_values(q_point)
+//                			    	  +
+//									  (1 - theta) *
+//               					  fe_values.shape_grad(i,q_point) //*
+								      //old_solution_u_values(q_point)
+//                			      )
+//							  +
+							  time_step *
+							  (
+									  theta *
+									  rhs_value *
+								      fe_values.shape_value(i,q_point)
+								      +
+								      (1 - theta) *
+								      old_rhs_value *
+								      fe_values.shape_value(i,q_point)
+				              )
+        				 ) *
+            		     fe_values.JxW(q_point);
+                  cell_rhs(i) += rhs_term;
                 }
+
             }
 
           cell->get_dof_indices (local_dof_indices);
-          constraints.distribute_local_to_global (cell_matrix,
-                                                  cell_rhs,
-                                                  local_dof_indices,
-                                                  system_matrix,
-                                                  system_rhs);
+
+        	  constraints.distribute_local_to_global (cell_matrix,
+        			  cell_rhs,
+        			  local_dof_indices,
+        			  system_matrix,
+        			  system_rhs);
         }
 
     system_matrix.compress (VectorOperation::add);
     system_rhs.compress (VectorOperation::add);
 
+
     // std::cout << "Number of locally owned cells  " << count << std::endl;    
   }
 
 
-
-
   template <int dim>
-  void LaplaceProblem<dim>::solve ()
+  void LaplaceProblem<dim>::solve(bool for_u)
   {
     TimerOutput::Scope t(computing_timer, "solve");
+
     LA::MPI::Vector
     completely_distributed_solution (locally_owned_dofs, mpi_communicator);
 
@@ -284,17 +386,25 @@ namespace Step40
 #endif
     preconditioner.initialize(system_matrix, data);
 
+
     solver.solve (system_matrix, completely_distributed_solution, system_rhs,
-                  preconditioner);
+    			preconditioner);
+
 
     pcout << "   Solved in " << solver_control.last_step()
           << " iterations." << std::endl;
 
     constraints.distribute (completely_distributed_solution);
+    if (for_u == true)
+    	old_locally_relevant_solution_u = locally_relevant_solution_u;
+    else
+    	old_locally_relevant_solution_v = locally_relevant_solution_v;
 
-    locally_relevant_solution = completely_distributed_solution;
+    if (for_u == true)
+    	locally_relevant_solution_u = completely_distributed_solution;
+    else
+    	locally_relevant_solution_v = completely_distributed_solution;
   }
-
 
 
 
@@ -307,7 +417,7 @@ namespace Step40
     KellyErrorEstimator<dim>::estimate (dof_handler,
                                         QGauss<dim-1>(3),
                                         typename FunctionMap<dim>::type(),
-                                        locally_relevant_solution,
+                                        locally_relevant_solution_u,
                                         estimated_error_per_cell);
     parallel::distributed::GridRefinement::
     refine_and_coarsen_fixed_number (triangulation,
@@ -324,7 +434,8 @@ namespace Step40
   {
     DataOut<dim> data_out;
     data_out.attach_dof_handler (dof_handler);
-    data_out.add_data_vector (locally_relevant_solution, "u");
+    data_out.add_data_vector (locally_relevant_solution_u, "u");
+    data_out.add_data_vector (locally_relevant_solution_v, "v");
 
     Vector<float> subdomain (triangulation.n_active_cells());
     for (unsigned int i=0; i<subdomain.size(); ++i)
@@ -364,18 +475,18 @@ namespace Step40
   template <int dim>
   void LaplaceProblem<dim>::run ()
   {
-    const unsigned int n_cycles = 8;
-    for (unsigned int cycle=0; cycle<n_cycles; ++cycle)
-      {
-        pcout << "Cycle " << cycle << ':' << std::endl;
-
-        if (cycle == 0)
-          {
-            GridGenerator::hyper_cube (triangulation);
+//    const unsigned int n_cycles = 8;
+//    for (unsigned int cycle=0; cycle<n_cycles; ++cycle)
+//      {
+//        pcout << "Cycle " << cycle << ':' << std::endl;
+//
+//        if (cycle == 0)
+//          {
+            GridGenerator::hyper_cube (triangulation, -1, 1);
             triangulation.refine_global (5);
-          }
-        else
-          refine_grid ();
+//          }
+//        else
+//          refine_grid ();
 
         setup_system ();
 
@@ -386,20 +497,34 @@ namespace Step40
               << dof_handler.n_dofs()
               << std::endl;
 
-        assemble_system ();
-        solve ();
-
-        if (Utilities::MPI::n_mpi_processes(mpi_communicator) <= 32)
+        for (timestep_number=1, time=time_step;
+             time<=.03125; //temporary
+             time+=time_step, ++timestep_number)
           {
-            TimerOutput::Scope t(computing_timer, "output");
-            output_results (cycle);
-          }
+            std::cout << "Time step " << timestep_number
+                      << " at t=" << time
+                      << std::endl;
 
-        computing_timer.print_summary ();
-        computing_timer.reset ();
+					for_u = true;
+					assemble_system (for_u);
+					solve (for_u);
 
-        pcout << std::endl;
-      }
+					for_u = false;
+					assemble_system (for_u);
+					solve (for_u);
+
+					int cycle = 1; // temporary
+					if (Utilities::MPI::n_mpi_processes(mpi_communicator) <= 32)
+					  {
+						TimerOutput::Scope t(computing_timer, "output");
+						output_results (cycle);
+					  }
+
+					computing_timer.print_summary ();
+					computing_timer.reset ();
+
+					pcout << std::endl;
+           }
   }
 }
 
